@@ -717,6 +717,259 @@ from fastapi.middleware.gzip import GZipMiddleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 ```
 
+## Frontend Architecture: Micro Frontend Pattern
+
+Modern AI platforms require modular, independently deployable frontend applications. The **Micro Frontend Architecture** enables parallel development, independent deployment, and technology flexibility.
+
+### Why Micro Frontends?
+
+**Traditional Monolithic Frontend**:
+- ❌ Single large bundle (5-10MB+)
+- ❌ Tight coupling between modules
+- ❌ All-or-nothing deployments
+- ❌ Coordination overhead across teams
+
+**Micro Frontend Approach**:
+- ✅ Small, focused bundles (500KB-1MB each)
+- ✅ Independent deployment per module
+- ✅ Technology flexibility (React, Vue, Svelte)
+- ✅ Team autonomy
+
+### Architecture
+
+```
+┌────────────────────────────────────────────────────────────┐
+│               Parent Application (Shell)                    │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Shared Services                                      │  │
+│  │  - Authentication state                               │  │
+│  │  - Navigation router                                  │  │
+│  │  - Design system (UI components)                     │  │
+│  │  - Theme provider                                     │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ Chat Module  │  │ Admin Portal │  │ Analytics        │  │
+│  │ (lazy loaded)│  │ (lazy loaded)│  │ Dashboard        │  │
+│  │              │  │              │  │ (lazy loaded)    │  │
+│  │ - Independ   │  │ - Independ   │  │ - Independ       │  │
+│  │   deploy     │  │   deploy     │  │   deploy         │  │
+│  │ - Own state  │  │ - Own state  │  │ - Own state      │  │
+│  └──────────────┘  └──────────────┘  └──────────────────┘  │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Key Benefits
+
+| Benefit | Description | Impact |
+|---------|-------------|--------|
+| **Lazy Loading** | Load modules on-demand, not upfront | 80% faster initial load |
+| **Independent Deployment** | Deploy Chat UI without redeploying Admin | 5x more frequent releases |
+| **Small Parent Bundle** | Parent shell is <500KB | Sub-second load time |
+| **Resource Sharing** | Shared auth, navigation, design system | Consistent UX |
+| **Technology Flexibility** | Use React for Chat, Vue for Analytics | Best tool for the job |
+
+### Implementation: Module Federation
+
+Using **Webpack Module Federation** for runtime code sharing:
+
+**Parent Application (Shell)**:
+```javascript
+// webpack.config.js (parent)
+module.exports = {
+  plugins: [
+    new ModuleFederationPlugin({
+      name: 'shell',
+      remotes: {
+        chat: 'chat@https://cdn.cortex.ai/chat/remoteEntry.js',
+        admin: 'admin@https://cdn.cortex.ai/admin/remoteEntry.js',
+        analytics: 'analytics@https://cdn.cortex.ai/analytics/remoteEntry.js',
+      },
+      shared: {
+        react: { singleton: true, eager: true },
+        'react-dom': { singleton: true, eager: true },
+        '@cortex/design-system': { singleton: true },
+      },
+    }),
+  ],
+};
+```
+
+**Child Module (Chat UI)**:
+```javascript
+// webpack.config.js (chat module)
+module.exports = {
+  plugins: [
+    new ModuleFederationPlugin({
+      name: 'chat',
+      filename: 'remoteEntry.js',
+      exposes: {
+        './ChatApp': './src/ChatApp',
+      },
+      shared: {
+        react: { singleton: true },
+        'react-dom': { singleton: true },
+        '@cortex/design-system': { singleton: true },
+      },
+    }),
+  ],
+};
+```
+
+**Parent Loads Module Dynamically**:
+```typescript
+// Parent shell
+import React, { lazy, Suspense } from 'react';
+
+const ChatApp = lazy(() => import('chat/ChatApp'));
+
+function App() {
+  return (
+    <Suspense fallback={<Loading />}>
+      <ChatApp />
+    </Suspense>
+  );
+}
+```
+
+### Module Responsibilities
+
+#### Parent Application (Shell)
+- **Authentication**: JWT token management, refresh logic
+- **Navigation**: React Router / Next.js routing
+- **Design System**: Shared UI components (buttons, forms, modals)
+- **Theme Provider**: Dark mode, branding, colors
+- **Error Boundary**: Global error handling
+- **Analytics**: Page view tracking, user events
+
+**Bundle Size**: ~300KB (gzipped)
+
+#### Chat Module (Child)
+- **Conversation UI**: Message list, input box, streaming responses
+- **Agent Selection**: Choose AI assistant
+- **Context Management**: File uploads, web searches
+- **Markdown Rendering**: Code blocks, math, tables
+
+**Bundle Size**: ~800KB (gzipped)
+**Loaded**: On-demand when user navigates to `/chat`
+
+#### Admin Portal (Child)
+- **User Management**: CRUD for users, roles, permissions
+- **Organization Setup**: Org hierarchy, project creation
+- **Billing Dashboard**: Usage reports, invoices
+- **System Configuration**: Feature flags, quotas
+
+**Bundle Size**: ~500KB (gzipped)
+**Loaded**: On-demand when user navigates to `/admin`
+
+#### Analytics Dashboard (Child)
+- **Usage Metrics**: API calls, LLM tokens, costs
+- **Performance Charts**: Latency, throughput, errors
+- **Cost Attribution**: Per-tenant, per-project breakdowns
+- **Query Builder**: Custom analytics queries
+
+**Bundle Size**: ~1.2MB (gzipped, includes charting libraries)
+**Loaded**: On-demand when user navigates to `/analytics`
+
+### Resource Sharing Control
+
+**Parent Controls**:
+- Which versions of shared libraries to use
+- Theme and branding enforcement
+- Authentication state propagation
+- Navigation and routing rules
+
+**Example**: Parent enforces React 18.2.0 across all modules to prevent version conflicts.
+
+### Independent Development
+
+**Team Autonomy**:
+```bash
+# Chat team deploys independently
+cd apps/chat
+npm run build
+aws s3 sync dist/ s3://cdn.cortex.ai/chat/
+
+# Admin team deploys independently (no coordination needed)
+cd apps/admin
+npm run build
+aws s3 sync dist/ s3://cdn.cortex.ai/admin/
+```
+
+**Zero downtime**: Parent shell continues serving while child modules update.
+
+### Performance Optimizations
+
+**Code Splitting**:
+```typescript
+// Split large dependencies per route
+const ChatApp = lazy(() => import(/* webpackChunkName: "chat" */ 'chat/ChatApp'));
+const AdminApp = lazy(() => import(/* webpackChunkName: "admin" */ 'admin/AdminApp'));
+```
+
+**CDN Caching**:
+```nginx
+# Cache static assets aggressively
+location ~* \.(js|css|png|jpg|jpeg|gif|svg|woff2)$ {
+  expires 1y;
+  add_header Cache-Control "public, immutable";
+}
+```
+
+**Bundle Analysis**:
+```bash
+# Identify large dependencies
+npx webpack-bundle-analyzer stats.json
+```
+
+### API Integration
+
+**All modules use the same API Gateway**:
+
+```typescript
+// Shared API client (provided by parent)
+import { apiClient } from '@cortex/api-client';
+
+// Chat module uses API client
+const messages = await apiClient.get('/api/v1/conversations/123/messages');
+
+// Admin module uses same client (shared auth token)
+const users = await apiClient.get('/api/v1/users');
+```
+
+**Benefits**:
+- Single authentication flow
+- Centralized error handling
+- Consistent retry logic
+- Unified request/response transformations
+
+### Deployment Strategy
+
+**Progressive Rollout**:
+1. Deploy new version to CDN (e.g., chat v2.0.0)
+2. Update parent config to point to new version
+3. Monitor error rates, performance metrics
+4. Rollback by reverting parent config (30 seconds)
+
+**Blue-Green Deployment**:
+```javascript
+// Parent can A/B test module versions
+const chatVersion = userIsInExperiment('chat-v2') ? 'v2.0.0' : 'v1.9.0';
+const ChatApp = lazy(() => import(`chat@${chatVersion}/ChatApp`));
+```
+
+### Comparison: Monolith vs Micro Frontends
+
+| Metric | Monolithic SPA | Micro Frontends | Improvement |
+|--------|---------------|-----------------|-------------|
+| **Initial Bundle** | 5-10MB | 300KB (shell only) | **95% smaller** |
+| **Time to Interactive** | 8-12 seconds | 1-2 seconds | **85% faster** |
+| **Deployment Frequency** | 1-2x/week | 10-20x/week | **10x more frequent** |
+| **Team Coordination** | High (merge conflicts) | Low (independent) | **80% less overhead** |
+| **Rollback Time** | 15-30 minutes | 30 seconds | **30x faster** |
+
+---
+
 ## Deployment Patterns
 
 ### Kubernetes Ingress

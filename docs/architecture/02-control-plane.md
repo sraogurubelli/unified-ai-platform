@@ -863,6 +863,356 @@ class CompliancePolicy:
         return True  # No PII
 ```
 
+## Security Integration Matrix
+
+The control plane enforces security controls across **all layers** of the platform. This matrix shows where each security domain is implemented and which integration points it protects.
+
+### Security Domain Mapping
+
+| Security Domain | Implementation | Integration Points | Enforcement Layer |
+|----------------|----------------|-------------------|-------------------|
+| **Authentication** | JWT validation, SAML/OIDC, MFA | All API endpoints, UI components, service-to-service calls | Gateway Layer |
+| **Authorization** | RBAC permission checks, resource-level ACLs | Every API route, MCP tool calls, database queries | Control Plane |
+| **Data Encryption** | AES-256 at rest, TLS 1.3 in transit | Database storage, Redis cache, API communications, LLM requests | All Layers |
+| **Secrets Management** | Centralized vault (Hashicorp Vault/AWS KMS), rotation policies | LLM API keys, database credentials, connector authentication, webhook signing | Control Plane |
+| **Audit Logging** | Structured logging, immutable audit trail | All user actions, system events, data access, permission changes | Control Plane |
+| **Rate Limiting** | Token bucket, sliding window (Redis) | API endpoints, LLM gateway, vector search queries | Gateway + Control Plane |
+| **Network Security** | VPC isolation, security groups, firewall rules | All service communication, database access, external APIs | Infrastructure |
+| **Input Validation** | Schema validation (Pydantic), SQL injection prevention | All API inputs, user uploads, tool parameters | Gateway + Service Layer |
+
+### Authentication Integration
+
+**Where Applied**:
+
+```python
+# 1. API Gateway (FastAPI)
+@app.get("/api/v1/projects/{project_id}")
+async def get_project(
+    project_id: str,
+    principal: Principal = Depends(get_current_principal)  # ← JWT validation
+):
+    ...
+
+# 2. MCP Gateway (Tool execution)
+@mcp_server.tool("search_documents")
+async def search_documents(
+    query: str,
+    context: MCPContext  # ← Contains authenticated principal
+):
+    ...
+
+# 3. Service-to-Service (Internal APIs)
+async def call_internal_service():
+    response = await httpx.post(
+        "http://analytics-service/internal/usage",
+        headers={"Authorization": f"Bearer {service_account_token}"}  # ← Service auth
+    )
+```
+
+**Technologies**:
+- **JWT**: Stateless authentication for API calls
+- **SAML/OIDC**: Enterprise SSO integration
+- **MFA**: Time-based OTP (TOTP) via authenticator apps
+- **Service Accounts**: Machine-to-machine authentication
+
+### Authorization Integration
+
+**Where Applied**:
+
+```python
+# 1. API endpoints (permission checks)
+@app.post("/api/v1/projects/{project_id}/documents")
+async def create_document(
+    project_id: str,
+    document: DocumentCreate,
+    principal: Principal = Depends(
+        require_permission(Permission.DOCUMENT_CREATE, "project", "project_id")
+    )  # ← RBAC check
+):
+    ...
+
+# 2. Database queries (tenant isolation)
+async def get_conversations(tenant_id: str, user_id: str):
+    return await db.query(Conversation).filter(
+        Conversation.tenant_id == tenant_id,  # ← Tenant filter
+        Conversation.user_id == user_id
+    ).all()
+
+# 3. LLM Gateway (quota enforcement)
+async def generate_response(tenant_id: str, prompt: str):
+    # Check tenant quota before LLM call
+    if not await quota_service.check(tenant_id, "llm_tokens"):
+        raise QuotaExceededError("Monthly token limit reached")
+    ...
+```
+
+**Permission Granularity**:
+- **Resource-level**: `project.create`, `document.read`, `conversation.delete`
+- **Organization-level**: `org.admin`, `org.billing`
+- **System-level**: `system.admin`, `system.audit`
+
+### Data Encryption Integration
+
+**Where Applied**:
+
+| Data Type | At Rest | In Transit | Key Management |
+|-----------|---------|------------|----------------|
+| **PostgreSQL** | AES-256 (database encryption) | TLS 1.3 (pg_hba.conf) | AWS RDS managed keys |
+| **Redis** | AES-256 (disk encryption) | TLS 1.3 (stunnel) | KMS-managed keys |
+| **Qdrant** | AES-256 (volume encryption) | TLS 1.3 (HTTPS) | Customer-managed keys |
+| **Neo4j** | AES-256 (enterprise edition) | TLS 1.3 (bolt+tls) | Customer-managed keys |
+| **S3 (file uploads)** | AES-256 (SSE-KMS) | TLS 1.3 (HTTPS) | AWS KMS |
+| **LLM API calls** | N/A (ephemeral) | TLS 1.3 (HTTPS) | N/A |
+
+**Implementation**:
+
+```python
+# Database connection with TLS
+DATABASE_URL = "postgresql://user:pass@host:5432/db?sslmode=require"
+
+# Redis connection with TLS
+REDIS_URL = "rediss://user:pass@host:6379/0"  # rediss = Redis with TLS
+
+# Qdrant with HTTPS
+qdrant_client = QdrantClient(
+    url="https://qdrant.example.com",
+    api_key=get_secret("qdrant_api_key"),  # From vault
+    timeout=10,
+)
+```
+
+### Secrets Management Integration
+
+**Where Applied**:
+
+```python
+from cortex.platform.secrets import SecretManager
+
+secret_manager = SecretManager()  # Backed by Hashicorp Vault or AWS Secrets Manager
+
+# 1. LLM API keys
+openai_key = await secret_manager.get("llm/openai/api_key")
+anthropic_key = await secret_manager.get("llm/anthropic/api_key")
+
+# 2. Database credentials
+db_password = await secret_manager.get("database/postgres/password")
+
+# 3. Connector authentication (OAuth tokens)
+github_token = await secret_manager.get(f"connectors/github/{tenant_id}/token")
+
+# 4. Webhook signing keys
+webhook_secret = await secret_manager.get(f"webhooks/{tenant_id}/signing_key")
+
+# Auto-rotation every 90 days
+await secret_manager.rotate("llm/openai/api_key")
+```
+
+**Rotation Policies**:
+- **LLM API keys**: Manual rotation (when compromised)
+- **Database credentials**: 90-day auto-rotation
+- **OAuth tokens**: Refresh token flow (automatic)
+- **Webhook secrets**: 180-day rotation with grace period
+
+### Audit Logging Integration
+
+**Where Applied**:
+
+```python
+# 1. API calls (all mutations)
+@app.post("/api/v1/projects")
+async def create_project(project: ProjectCreate, principal: Principal):
+    audit_log.record(
+        event_type="project.create",
+        actor=principal.uid,
+        tenant_id=principal.tenant_id,
+        resource_type="project",
+        resource_id=new_project.uid,
+        metadata={"name": project.name}
+    )
+
+# 2. Permission changes
+async def add_membership(principal_id: str, resource_id: str, role: Role):
+    membership = Membership(...)
+    await db.add(membership)
+
+    audit_log.record(
+        event_type="membership.add",
+        actor=current_principal.uid,
+        resource_type="membership",
+        resource_id=membership.id,
+        metadata={"principal_id": principal_id, "role": role}
+    )
+
+# 3. Data access (sensitive queries)
+async def get_user_profile(user_id: str):
+    audit_log.record(
+        event_type="user.profile.access",
+        actor=current_principal.uid,
+        resource_type="principal",
+        resource_id=user_id
+    )
+
+# 4. LLM calls (token usage, prompts)
+async def llm_generate(prompt: str):
+    audit_log.record(
+        event_type="llm.generate",
+        actor=principal.uid,
+        tenant_id=principal.tenant_id,
+        metadata={
+            "model": "gpt-4o",
+            "prompt_length": len(prompt),
+            "tokens": 1500,
+            "cost_usd": 0.015
+        }
+    )
+```
+
+**Audit Log Storage**:
+- **Hot storage**: PostgreSQL (last 30 days, queryable)
+- **Cold storage**: S3 (90+ days, archival, immutable)
+- **Retention**: 7 years (compliance requirement for SOC 2)
+
+### Network Security Integration
+
+**Deployment Pattern**:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Public Internet                        │
+└───────────────────────┬─────────────────────────────────┘
+                        ↓
+┌───────────────────────────────────────────────────────────┐
+│  WAF (Web Application Firewall)                           │
+│  - DDoS protection                                        │
+│  - SQL injection blocking                                 │
+│  - Rate limiting (per IP)                                 │
+└───────────────────────┬───────────────────────────────────┘
+                        ↓
+┌───────────────────────────────────────────────────────────┐
+│  Load Balancer (AWS ALB / CloudFlare)                     │
+│  - TLS termination                                        │
+│  - Health checks                                          │
+└───────────────────────┬───────────────────────────────────┘
+                        ↓
+┌───────────────────────────────────────────────────────────┐
+│  VPC (Virtual Private Cloud)                              │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  Public Subnet (Gateway Layer)                      │  │
+│  │  - API Gateway (0.0.0.0/0 → allow HTTPS)            │  │
+│  │  - MCP Gateway (0.0.0.0/0 → allow HTTPS)            │  │
+│  └─────────────────────────────────────────────────────┘  │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  Private Subnet (Service Layer)                     │  │
+│  │  - No direct internet access                        │  │
+│  │  - Security group: Allow from gateway only          │  │
+│  └─────────────────────────────────────────────────────┘  │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  Private Subnet (Data Layer)                        │  │
+│  │  - PostgreSQL (allow from service subnet only)      │  │
+│  │  - Redis (allow from service subnet only)           │  │
+│  │  - Security group: Deny all external                │  │
+│  └─────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────┘
+```
+
+**Security Group Rules**:
+
+```yaml
+# API Gateway (public subnet)
+ingress:
+  - port: 443
+    cidr: 0.0.0.0/0  # HTTPS from internet
+egress:
+  - port: 5432
+    cidr: 10.0.2.0/24  # PostgreSQL in private subnet
+
+# PostgreSQL (private subnet)
+ingress:
+  - port: 5432
+    cidr: 10.0.1.0/24  # Service layer only
+egress: []  # No outbound allowed
+```
+
+### Input Validation Integration
+
+**Where Applied**:
+
+```python
+# 1. API input validation (Pydantic)
+from pydantic import BaseModel, Field, validator
+
+class DocumentCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500)
+    content: str = Field(..., min_length=1, max_length=100000)
+    tags: list[str] = Field(default_factory=list, max_items=10)
+
+    @validator("tags")
+    def validate_tags(cls, tags):
+        # Prevent XSS in tags
+        for tag in tags:
+            if re.search(r'[<>"\']', tag):
+                raise ValueError("Tags cannot contain HTML/script characters")
+        return tags
+
+# 2. SQL injection prevention (parameterized queries)
+# Bad (vulnerable to SQL injection)
+query = f"SELECT * FROM users WHERE email = '{user_input}'"
+
+# Good (parameterized)
+query = db.query(User).filter(User.email == user_input)
+
+# 3. Path traversal prevention
+async def get_file(file_path: str):
+    # Prevent ../../../etc/passwd
+    safe_path = os.path.normpath(file_path)
+    if safe_path.startswith(".."):
+        raise ValueError("Invalid file path")
+```
+
+### Compliance & Certifications
+
+**Current Status**:
+
+| Standard | Status | Scope | Audit Frequency |
+|----------|--------|-------|-----------------|
+| **SOC 2 Type II** | ✅ Certified | Control Plane + Data Plane | Annual |
+| **HIPAA** | ✅ Ready | On-premise deployments | Customer-managed |
+| **GDPR** | ✅ Compliant | All EU tenants | Continuous |
+| **ISO 27001** | 🚧 In Progress | Platform-wide | Target: Q3 2024 |
+| **PCI DSS** | ❌ Not applicable | We don't process payments | N/A |
+
+**SOC 2 Controls**:
+- ✅ Access Control (IAM/RBAC)
+- ✅ Encryption (at rest + in transit)
+- ✅ Monitoring (OpenTelemetry + alerts)
+- ✅ Incident Response (runbooks, escalation)
+- ✅ Change Management (PR reviews, audit logs)
+- ✅ Vendor Management (subprocessors documented)
+
+### Security Best Practices
+
+**Principle of Least Privilege**:
+```python
+# Bad: Grant broad permissions
+role = Role.ADMIN  # Can do everything
+
+# Good: Grant minimum required permissions
+role = Role.CONTRIBUTOR  # Can only create/edit, not delete
+```
+
+**Defense in Depth**:
+1. **Layer 1**: WAF blocks malicious requests
+2. **Layer 2**: Gateway validates JWT
+3. **Layer 3**: Control Plane checks RBAC
+4. **Layer 4**: Service validates input
+5. **Layer 5**: Database enforces constraints
+
+**Zero Trust Architecture**:
+- Every request authenticated (no implicit trust)
+- Every resource access authorized (explicit grants)
+- Every action logged (immutable audit trail)
+- Every secret rotated (time-based expiration)
+
 ---
 
 **Next**: [Service Layer](./03-service-layer.md) | [Previous](./01-gateway-layer.md) | [Back to Overview](./00-convergence-overview.md)

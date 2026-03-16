@@ -922,65 +922,542 @@ class ModelManager:
         return fallbacks.get(primary)
 ```
 
-## Service Communication Patterns
+## Event-Driven Integration
 
-### Synchronous (HTTP/gRPC)
+### Overview
+
+The platform uses **event-driven architecture** for service communication, enabling loose coupling, scalability, and asynchronous processing. Services publish events when state changes, and other services subscribe to react to those changes.
+
+**Benefits**:
+- **Decoupling**: Services don't need to know about each other
+- **Scalability**: Multiple consumers can process events in parallel
+- **Resilience**: Failed consumers can replay events
+- **Audit Trail**: All state changes captured as events
+
+### Event Streaming Technologies
+
+| Technology | Use Case | Latency | Throughput | Persistence |
+|------------|----------|---------|------------|-------------|
+| **Kafka** | High-volume event streaming | 5-10ms | 1M+ msg/sec | Days to weeks |
+| **Redis Streams** | Real-time events, session data | 1-3ms | 100K+ msg/sec | Hours to days |
+| **PostgreSQL** | ACID event sourcing | 10-50ms | 10K msg/sec | Permanent |
+
+**Recommended Stack**:
+- **Kafka**: Enterprise deployments (high volume, strict ordering)
+- **Redis Streams**: Startup/scale-up (lower complexity, good performance)
+- **PostgreSQL**: Event sourcing with strong consistency guarantees
+
+### Event Types
 
 ```python
-# Service-to-service HTTP calls
-async def get_project_stats(project_id: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"http://project-service:8000/projects/{project_id}/stats"
-        )
-    return response.json()
+class EventType(str, Enum):
+    # Resource lifecycle events
+    PROJECT_CREATED = "project.created"
+    PROJECT_UPDATED = "project.updated"
+    PROJECT_DELETED = "project.deleted"
+
+    # AI service events
+    CONVERSATION_CREATED = "conversation.created"
+    MESSAGE_SENT = "message.sent"
+    LLM_CALL_COMPLETED = "llm.call.completed"
+
+    # Analytics events
+    USAGE_RECORDED = "usage.recorded"
+    QUOTA_EXCEEDED = "quota.exceeded"
+
+    # Knowledge graph events
+    ENTITY_EXTRACTED = "entity.extracted"
+    RELATIONSHIP_CREATED = "relationship.created"
 ```
 
-### Asynchronous (Events/Messages)
+### Event Schema
+
+**Standard Event Envelope**:
 
 ```python
-# Event-driven communication via Redis Streams
-class EventBus:
-    """Publish/subscribe event bus."""
+from pydantic import BaseModel
+from datetime import datetime
 
-    async def publish(self, event: str, payload: dict):
-        """Publish event to Redis stream."""
+class Event(BaseModel):
+    """Standard event envelope."""
 
-        await redis.xadd(
-            f"events:{event}",
-            {"data": json.dumps(payload)}
+    event_id: str  # Unique event ID (UUID)
+    event_type: str  # Event type (e.g., "conversation.created")
+    timestamp: datetime  # When event occurred
+    tenant_id: str  # Tenant context
+    actor_id: str  # Who triggered the event (user/service)
+    resource_type: str  # Type of resource (e.g., "conversation")
+    resource_id: str  # Resource identifier
+    payload: dict  # Event-specific data
+    metadata: dict = {}  # Optional metadata (trace_id, span_id, etc.)
+```
+
+**Example Event**:
+
+```json
+{
+  "event_id": "evt_abc123",
+  "event_type": "conversation.created",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "tenant_id": "acct_xyz789",
+  "actor_id": "user_456",
+  "resource_type": "conversation",
+  "resource_id": "conv_789",
+  "payload": {
+    "project_id": "proj_123",
+    "title": "AI Platform Discussion",
+    "model": "gpt-4o"
+  },
+  "metadata": {
+    "trace_id": "trace-abc",
+    "source": "chat-service"
+  }
+}
+```
+
+### Event Bus Implementation
+
+#### Option 1: Redis Streams (Recommended for Startups)
+
+```python
+import redis.asyncio as redis
+import json
+from typing import AsyncGenerator
+
+class RedisEventBus:
+    """Event bus using Redis Streams."""
+
+    def __init__(self, redis_url: str):
+        self.redis = redis.from_url(redis_url)
+
+    async def publish(self, event: Event) -> str:
+        """
+        Publish event to Redis stream.
+
+        Returns:
+            str: Message ID
+        """
+        stream_key = f"events:{event.event_type}"
+
+        message_id = await self.redis.xadd(
+            stream_key,
+            {
+                "event_id": event.event_id,
+                "data": event.json()
+            }
         )
 
-    async def subscribe(self, event: str, consumer_group: str):
-        """Subscribe to events."""
+        # Also publish to global event stream for analytics
+        await self.redis.xadd(
+            "events:all",
+            {"data": event.json()}
+        )
 
-        # Create consumer group
+        return message_id
+
+    async def subscribe(
+        self,
+        event_type: str,
+        consumer_group: str,
+        consumer_name: str
+    ) -> AsyncGenerator[Event, None]:
+        """
+        Subscribe to events.
+
+        Args:
+            event_type: Type of events to subscribe to
+            consumer_group: Consumer group name (for load balancing)
+            consumer_name: Unique consumer identifier
+        """
+        stream_key = f"events:{event_type}"
+
+        # Create consumer group (idempotent)
         try:
-            await redis.xgroup_create(
-                f"events:{event}",
+            await self.redis.xgroup_create(
+                stream_key,
                 consumer_group,
-                id="0"
+                id="0",
+                mkstream=True
             )
-        except:
+        except redis.ResponseError:
             pass  # Group already exists
 
         # Read events
         while True:
-            events = await redis.xreadgroup(
+            # Read new events (block for 1 second if no events)
+            events = await self.redis.xreadgroup(
                 consumer_group,
-                "consumer-1",
-                {f"events:{event}": ">"},
-                count=10
+                consumer_name,
+                {stream_key: ">"},
+                count=10,
+                block=1000
             )
 
             for stream, messages in events:
                 for message_id, data in messages:
-                    payload = json.loads(data[b"data"])
-                    yield payload
+                    event = Event.parse_raw(data[b"data"])
+                    yield event
 
-                    # Acknowledge
-                    await redis.xack(stream, consumer_group, message_id)
+                    # Acknowledge processing
+                    await self.redis.xack(stream, consumer_group, message_id)
 ```
+
+#### Option 2: Kafka (Recommended for Enterprise)
+
+```python
+from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+import json
+
+class KafkaEventBus:
+    """Event bus using Apache Kafka."""
+
+    def __init__(self, bootstrap_servers: list[str]):
+        self.bootstrap_servers = bootstrap_servers
+        self.producer = None
+        self.consumers = {}
+
+    async def start(self):
+        """Initialize Kafka producer."""
+        self.producer = AIOKafkaProducer(
+            bootstrap_servers=self.bootstrap_servers,
+            value_serializer=lambda v: json.dumps(v).encode()
+        )
+        await self.producer.start()
+
+    async def publish(self, event: Event):
+        """
+        Publish event to Kafka topic.
+
+        Topic naming: events.{event_type}
+        e.g., "events.conversation.created"
+        """
+        topic = f"events.{event.event_type}"
+
+        await self.producer.send_and_wait(
+            topic,
+            value=event.dict(),
+            key=event.tenant_id.encode()  # Partition by tenant
+        )
+
+    async def subscribe(
+        self,
+        event_type: str,
+        consumer_group: str
+    ) -> AsyncGenerator[Event, None]:
+        """Subscribe to events from Kafka topic."""
+
+        topic = f"events.{event_type}"
+
+        consumer = AIOKafkaConsumer(
+            topic,
+            bootstrap_servers=self.bootstrap_servers,
+            group_id=consumer_group,
+            value_deserializer=lambda m: json.loads(m.decode()),
+            enable_auto_commit=False  # Manual commit for reliability
+        )
+
+        await consumer.start()
+
+        try:
+            async for message in consumer:
+                event = Event(**message.value)
+                yield event
+
+                # Commit offset after successful processing
+                await consumer.commit()
+        finally:
+            await consumer.stop()
+```
+
+### Service Integration Patterns
+
+#### Pattern 1: Analytics Pipeline
+
+**LLM Gateway publishes usage events → ClickHouse consumes for analytics**
+
+```python
+# LLM Gateway (Publisher)
+class LLMGateway:
+    async def generate(self, prompt: str, model: str, tenant_id: str):
+        response = await llm_provider.generate(prompt, model)
+
+        # Publish usage event
+        await event_bus.publish(Event(
+            event_id=str(uuid.uuid4()),
+            event_type="llm.call.completed",
+            timestamp=datetime.utcnow(),
+            tenant_id=tenant_id,
+            actor_id=current_principal.uid,
+            resource_type="llm_call",
+            resource_id=str(uuid.uuid4()),
+            payload={
+                "model": model,
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "cost_usd": calculate_cost(response.usage, model)
+            }
+        ))
+
+        return response
+
+# Analytics Service (Consumer)
+class AnalyticsConsumer:
+    async def process_llm_events(self):
+        """Consume LLM events and write to ClickHouse."""
+
+        async for event in event_bus.subscribe(
+            "llm.call.completed",
+            consumer_group="analytics"
+        ):
+            await clickhouse.execute("""
+                INSERT INTO llm_usage (
+                    timestamp, tenant_id, model,
+                    prompt_tokens, completion_tokens, cost_usd
+                ) VALUES
+            """, [(
+                event.timestamp,
+                event.tenant_id,
+                event.payload["model"],
+                event.payload["prompt_tokens"],
+                event.payload["completion_tokens"],
+                event.payload["cost_usd"]
+            )])
+```
+
+#### Pattern 2: Knowledge Graph Enrichment
+
+**Chat Service publishes conversation events → Knowledge Graph extracts entities**
+
+```python
+# Chat Service (Publisher)
+async def create_message(conversation_id: str, content: str):
+    message = Message(conversation_id=conversation_id, content=content)
+    await db.add(message)
+
+    # Publish event for knowledge graph processing
+    await event_bus.publish(Event(
+        event_type="message.sent",
+        tenant_id=tenant_id,
+        resource_type="message",
+        resource_id=message.uid,
+        payload={
+            "conversation_id": conversation_id,
+            "content": content
+        }
+    ))
+
+# Knowledge Graph Service (Consumer)
+class KnowledgeGraphConsumer:
+    async def process_messages(self):
+        """Extract entities from new messages."""
+
+        async for event in event_bus.subscribe(
+            "message.sent",
+            consumer_group="knowledge-graph"
+        ):
+            content = event.payload["content"]
+
+            # Extract entities using NER
+            entities = await entity_extractor.extract(content)
+
+            for entity in entities:
+                await neo4j.run("""
+                    MERGE (e:Entity {name: $name, type: $type})
+                    MERGE (d:Document {id: $message_id})
+                    MERGE (d)-[:MENTIONS {confidence: $confidence}]->(e)
+                """, name=entity.name, type=entity.type,
+                    message_id=event.resource_id,
+                    confidence=entity.confidence)
+```
+
+#### Pattern 3: Rate Limiting Updates
+
+**Usage Service publishes quota events → LLM Gateway updates rate limits**
+
+```python
+# Usage Service (Publisher)
+async def record_usage(tenant_id: str, quota_type: str, amount: int):
+    # Record in database
+    await db.add(Usage(...))
+
+    # Check if quota exceeded
+    total = await db.query(Usage).filter(
+        Usage.tenant_id == tenant_id,
+        Usage.quota_type == quota_type,
+        Usage.period == current_month()
+    ).sum(Usage.amount)
+
+    tier_limit = get_tier_limit(tenant_id, quota_type)
+
+    if total > tier_limit:
+        # Publish quota exceeded event
+        await event_bus.publish(Event(
+            event_type="quota.exceeded",
+            tenant_id=tenant_id,
+            resource_type="quota",
+            resource_id=quota_type,
+            payload={
+                "quota_type": quota_type,
+                "limit": tier_limit,
+                "current": total
+            }
+        ))
+
+# LLM Gateway (Consumer)
+class LLMGatewayConsumer:
+    async def process_quota_events(self):
+        """Update rate limits when quotas exceeded."""
+
+        async for event in event_bus.subscribe(
+            "quota.exceeded",
+            consumer_group="llm-gateway"
+        ):
+            tenant_id = event.tenant_id
+            quota_type = event.payload["quota_type"]
+
+            # Update Redis rate limiter
+            await redis.set(
+                f"rate_limit:{tenant_id}:{quota_type}",
+                "exceeded",
+                ex=3600  # Block for 1 hour
+            )
+```
+
+### Data Consistency Patterns
+
+#### Eventual Consistency
+
+Most events use **eventual consistency** - subscribers process events asynchronously:
+
+```python
+# Order of operations:
+# 1. Database write (source of truth)
+# 2. Event published
+# 3. Consumers update derived state
+
+async def create_project(project: Project):
+    # 1. Write to PostgreSQL
+    await db.add(project)
+    await db.commit()
+
+    # 2. Publish event
+    await event_bus.publish(Event(event_type="project.created", ...))
+
+    # 3. Consumers eventually update:
+    #    - Search index (Qdrant)
+    #    - Analytics (ClickHouse)
+    #    - Cache (Redis)
+```
+
+#### Strong Consistency (Event Sourcing)
+
+For critical workflows, use **event sourcing** with PostgreSQL:
+
+```python
+# All state changes stored as events
+class EventStore:
+    async def append(self, event: Event):
+        """Append event to event log."""
+
+        await db.execute("""
+            INSERT INTO event_log (
+                event_id, event_type, aggregate_id,
+                data, timestamp
+            ) VALUES ($1, $2, $3, $4, $5)
+        """, event.event_id, event.event_type,
+             event.resource_id, event.json(),
+             event.timestamp)
+
+    async def get_events(self, aggregate_id: str) -> list[Event]:
+        """Get all events for aggregate."""
+
+        rows = await db.fetch("""
+            SELECT data FROM event_log
+            WHERE aggregate_id = $1
+            ORDER BY timestamp ASC
+        """, aggregate_id)
+
+        return [Event.parse_raw(row["data"]) for row in rows]
+
+# Rebuild state from events
+async def get_conversation_state(conversation_id: str):
+    events = await event_store.get_events(conversation_id)
+
+    conversation = Conversation(id=conversation_id)
+    for event in events:
+        conversation.apply(event)  # Apply event to update state
+
+    return conversation
+```
+
+### Monitoring & Observability
+
+**Event Metrics**:
+
+```python
+from prometheus_client import Counter, Histogram
+
+events_published = Counter(
+    "events_published_total",
+    "Total events published",
+    ["event_type", "tenant_id"]
+)
+
+event_processing_time = Histogram(
+    "event_processing_seconds",
+    "Time to process event",
+    ["event_type", "consumer_group"]
+)
+
+# Track metrics
+events_published.labels(
+    event_type="conversation.created",
+    tenant_id=tenant_id
+).inc()
+
+with event_processing_time.labels(
+    event_type="conversation.created",
+    consumer_group="analytics"
+).time():
+    await process_event(event)
+```
+
+**Event Tracing**:
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer(__name__)
+
+# Propagate trace context via event metadata
+with tracer.start_as_current_span("publish_event") as span:
+    event.metadata["trace_id"] = format(span.get_span_context().trace_id, '032x')
+    event.metadata["span_id"] = format(span.get_span_context().span_id, '016x')
+
+    await event_bus.publish(event)
+
+# Consumer creates child span
+with tracer.start_as_current_span(
+    "process_event",
+    context=trace_context_from_event(event)  # Parent span
+) as span:
+    await process_event(event)
+```
+
+### Comparison: Synchronous vs Event-Driven
+
+| Aspect | Synchronous (HTTP/gRPC) | Event-Driven (Kafka/Redis) |
+|--------|------------------------|----------------------------|
+| **Coupling** | Tight (caller knows callee) | Loose (publisher doesn't know consumers) |
+| **Latency** | Low (5-50ms) | Higher (50-500ms) |
+| **Reliability** | Fails if service down | Resilient (replay events) |
+| **Scalability** | Limited (point-to-point) | High (many consumers) |
+| **Use Case** | Real-time requests (get user profile) | Async workflows (send email, update analytics) |
+
+**When to Use Each**:
+
+✅ **Synchronous**: User-facing requests, critical path operations
+✅ **Event-Driven**: Analytics, notifications, cross-service state sync, audit logging
 
 ---
 
